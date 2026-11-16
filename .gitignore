@@ -1,0 +1,28 @@
+.git
+.env
+.DS_Store
+airflow_settings.yaml
+__pycache__/
+astro
+.venv
+.astro/standalone/
+airflow-webserver.pid
+webserver_config.py
+airflow.cfg
+airflow.db
+.astro/*.local.yml
+.astro/*.local.yaml
+
+
+# Environment and credentials
+.env.*
+*.pem
+*.p8
+*.key
+
+# Generated NASCAR datasets
+data/
+csvs/*.csv
+
+# Python cache
+*.pyc
