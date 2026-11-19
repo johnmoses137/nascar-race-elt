@@ -26,3 +26,9 @@ csvs/*.csv
 
 # Python cache
 *.pyc
+include/secrets/
+
+# Local development configuration
+.astro/
+.vscode/
+include/docker-compose.override.yml
