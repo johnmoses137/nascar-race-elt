@@ -20,18 +20,20 @@ Python extracts race data from NASCAR’s REST endpoints, Snowflake stores and t
 The diagram shows **execution order**, with Airflow coordinating all five tasks.
 
 ```mermaid
-flowchart LR
-    subgraph AF["Airflow Orchestration · Docker / Astro CLI"]
-        direction LR
-        E["Extract<br/>NASCAR APIs to local JSON"]
-        B["Load Bronze<br/>Stage and load raw JSON"]
-        S["Build Silver<br/>Race and driver results"]
-        Q{"Quality Checks<br/>Validate Bronze and Silver"}
-        G["Build Gold<br/>Driver-season summary"]
+flowchart TB
+    AF["Apache Airflow"]
+    AF -.-> PIPELINE
 
-        E --> B --> S --> Q
-        Q -->|Pass| G
+    subgraph PIPELINE["NASCAR ELT Pipeline"]
+        direction LR
+        E["Extract NASCAR Data"] --> B["Bronze<br/>Raw Data"]
+        B --> S["Silver<br/>Structured Data"]
+        S --> Q["Quality Checks"]
+        Q -->|Pass| G["Gold<br/>Driver Season Summary"]
+        Q -->|Fail| STOP["Stop"]
     end
+
+    style PIPELINE fill:transparent
 ```
 
 Quality checks run **after Silver is built**. They read Bronze and Silver, including comparing their result counts. A failed check blocks the Gold build.
