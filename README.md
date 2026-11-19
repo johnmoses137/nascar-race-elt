@@ -1,286 +1,279 @@
 # NASCAR Race ELT Pipeline
 
-A batch data engineering project that extracts **2025 NASCAR Cup Series** race data from NASCAR's JSON REST endpoints, loads original responses into Snowflake, and transforms them into relational race results and driver-season summaries. Apache Airflow orchestrates the workflow locally through Docker and the Astronomer Astro CLI.
+An end-to-end batch pipeline that transforms **2025 NASCAR Cup Series data** into driver-season performance summaries.
 
-The project demonstrates warehouse-centered ELT, semi-structured data modeling, task dependencies, and SQL quality gates. Its implemented scope is a fixed-season portfolio pipeline; it is not a production deployment or a live race-tracking service.
+Python extracts race data from NASCAR’s REST endpoints, Snowflake stores and transforms it through **Bronze, Silver, and Gold layers**, and Apache Airflow coordinates execution. The local development environment runs with Docker and the Astronomer Astro CLI.
+
+## Technology Stack
+
+| Technology | Role |
+| --- | --- |
+| Python and `requests` | API extraction and response validation |
+| Snowflake and SQL | JSON storage, relational transformations, and analytical aggregation |
+| `snowflake-connector-python` | Authentication, file loading, and SQL execution |
+| Apache Airflow | Task scheduling, dependencies, and retries |
+| Docker and Astro CLI | Local Airflow environment |
+| pandas | Optional CSV export and exploration |
 
 ## Architecture
 
+The diagram shows **execution order**, with Airflow coordinating all five tasks.
+
 ```mermaid
 flowchart LR
-    API["NASCAR JSON APIs<br/>2025 Cup Series"] --> EX["Python extraction<br/>HTTP and response checks"]
-    EX --> RAW["Local JSON files<br/>include/data/raw"]
-    RAW --> STAGE["Snowflake internal stage<br/>BRONZE.RAW_JSON_STAGE"]
-    STAGE --> B["Bronze<br/>RAW_NASCAR_JSON"]
-    B --> S["Silver MERGE<br/>RACES and RACE_RESULTS"]
-    S --> Q{"SQL quality checks"}
-    B --> Q
-    Q -->|Pass| G["Gold table rebuild<br/>DRIVER_SEASON_SUMMARY"]
-    Q -->|Fail| STOP["Task fails<br/>Gold build blocked"]
-    AF["Airflow in Docker<br/>Astro CLI local runtime"] -. orchestrates .-> EX
-    AF -. orchestrates .-> STAGE
-    AF -. orchestrates .-> S
-    AF -. orchestrates .-> Q
-    AF -. orchestrates .-> G
+    subgraph AF["Airflow Orchestration · Docker / Astro CLI"]
+        direction LR
+        E["Extract<br/>NASCAR APIs to local JSON"]
+        B["Load Bronze<br/>Stage and load raw JSON"]
+        S["Build Silver<br/>Race and driver results"]
+        Q{"Quality Checks<br/>Validate Bronze and Silver"}
+        G["Build Gold<br/>Driver-season summary"]
+
+        E --> B --> S --> Q
+        Q -->|Pass| G
+    end
 ```
 
-Raw payloads move through files and Snowflake tables; the DAG does not pass datasets through XCom. Transformation SQL runs in Snowflake through the Python connector.
+Quality checks run **after Silver is built**. They read Bronze and Silver, including comparing their result counts. A failed check blocks the Gold build.
 
-## Technology stack
+Gold reads its data directly from Silver. The arrows represent task dependencies, not data passing through the quality checks. Snowflake executes the warehouse SQL; the enclosing box represents Airflow’s orchestration scope.
 
-| Technology | Implemented role |
+## Data Sources and Extraction
+
+The pipeline uses two NASCAR JSON endpoints:
+
+| Source | Endpoint |
 | --- | --- |
-| Python | HTTP extraction, local file handling, Snowflake loading, and SQL execution |
-| `requests` | REST requests with a 30-second timeout and HTTP status checks |
-| Snowflake | Internal staging, JSON storage, relational transformations, quality queries, and aggregation |
-| `snowflake-connector-python` | Key-pair authentication, `PUT`, `COPY INTO`, and SQL execution |
-| Apache Airflow | Five sequential `BashOperator` tasks using the Airflow SDK and standard provider |
-| Docker / Astro CLI | Local Airflow runtime defined by `astrocrpublic.azurecr.io/runtime:3.3-12` |
-| pandas | Optional standalone CSV exploration scripts; not used by the DAG |
+| Season event list | `https://cf.nascar.com/cacher/2025/1/race_list_basic.json` |
+| Race weekend feed | `https://cf.nascar.com/cacher/2025/1/{race_id}/weekend-feed.json` |
 
-`requirements.txt` declares `requests` and `snowflake-connector-python` without version pins. Airflow comes from the Astro Runtime image. `packages.txt` is empty. pandas is not explicitly declared in the project requirements.
+[`include/extract.py`](include/extract.py) saves the season event list, selects points-paying races using `race_type_id == 1`, and requests each selected race’s weekend feed sequentially.
 
-## Data sources and extraction
+Extraction includes:
 
-The code calls two NASCAR endpoints without API credentials:
+- A 30-second timeout and HTTP status validation for each request.
+- Validation that the returned race ID matches the requested race.
+- A check that race results are present.
+- Preservation of original JSON responses under `include/data/raw/`.
 
-- Season event list: `https://cf.nascar.com/cacher/2025/1/race_list_basic.json`
-- Per-race weekend feed: `https://cf.nascar.com/cacher/2025/1/{race_id}/weekend-feed.json`
+The season and series are fixed to **2025 Cup Series**. Each run requests that dataset again rather than extracting only new races.
 
-In these URLs, the implementation fixes the season to `2025` and series to `1` (Cup Series). They are not DAG parameters.
+## Snowflake Data Layers
 
-[`include/extract.py`](include/extract.py):
+All warehouse objects belong to the `NASCAR_RACE_ELT` database.
 
-1. Fetches the event list, checks the HTTP response, parses the JSON, and saves the original response as `include/data/raw/race_list_2025.json`.
-2. Selects events with `race_type_id == 1` for points-race extraction. The script's comment identifies 36 points races, but the actual loop follows the returned event list and does not assert a fixed count.
-3. Requests each selected race sequentially and reads `weekend_race[0]`.
-4. Rejects a feed when its race ID differs from the requested ID or its results are empty.
-5. Saves the original weekend response as `race_{race_id}_{YYYY-MM-DD}.json` and logs progress.
+### Bronze — Original API Responses
 
-Each HTTP request has a 30-second timeout and uses `raise_for_status()`. There is no request-level retry loop; Airflow retries the entire extraction task. Extraction downloads the fixed season again on every run and does not clear stale local files.
+[`include/load_bronze.py`](include/load_bronze.py) uploads local JSON files to `BRONZE.RAW_JSON_STAGE` using `PUT`, then loads them into `BRONZE.RAW_NASCAR_JSON` with `COPY INTO`.
 
-## Snowflake data layers
+The table retains:
 
-All SQL targets the database `NASCAR_RACE_ELT`.
-
-### Bronze: original responses and ingestion metadata
-
-[`include/load_bronze.py`](include/load_bronze.py) uploads all JSON files in `include/data/raw/` to `BRONZE.RAW_JSON_STAGE`, lists staged files, and copies data into `BRONZE.RAW_NASCAR_JSON`:
-
-| Column | Loaded value |
+| Column | Content |
 | --- | --- |
-| `RAW_DATA` | JSON document (`VARIANT`) |
-| `SOURCE_FILE` | `METADATA$FILENAME` |
-| `LOADED_AT` | `METADATA$START_SCAN_TIME` |
+| `RAW_DATA` | Original JSON stored as `VARIANT` |
+| `SOURCE_FILE` | Source filename |
+| `LOADED_AT` | Ingestion scan timestamp |
 
-`STRIP_OUTER_ARRAY = FALSE` preserves the outer event-list array. `ON_ERROR = ABORT_STATEMENT` fails the copy on a loading error. The script prints the total Bronze row count; this is an observation, not a row-count assertion.
+The JSON format preserves outer arrays, and loading errors abort the copy statement.
 
-The loader does not truncate Bronze, force reloads, overwrite staged files explicitly, or implement version selection. It relies on Snowflake's default stage and copy behavior. Re-fetching a changed API response under an existing filename is not an implemented refresh strategy.
+### Silver — Structured Race Data
 
-### Silver: typed race and driver-result tables
+[`include/sql/build_silver.sql`](include/sql/build_silver.sql) extracts typed fields from JSON and expands nested driver results using `LATERAL FLATTEN`.
 
-[`include/sql/build_silver.sql`](include/sql/build_silver.sql) uses two `MERGE` statements:
-
-| Table | Intended grain / merge key | Columns extracted |
+| Table | Intended grain | Merge key |
 | --- | --- | --- |
-| `SILVER.RACES` | One row per `race_id` | `race_id`, `race_season`, `race_name`, `race_date`, `track_name`, `number_of_cars_in_field` |
-| `SILVER.RACE_RESULTS` | One row per `(race_id, driver_id)` | `race_id`, `driver_id`, `driver_name`, `starting_position`, `finishing_position`, `laps_completed`, `finishing_status` |
+| `SILVER.RACES` | One record per race | `race_id` |
+| `SILVER.RACE_RESULTS` | One record per driver per race | `race_id`, `driver_id` |
 
-JSON paths select `weekend_race[0]`, explicit casts establish relational types, and `LATERAL FLATTEN` expands nested driver results. Dates use the first ten characters of the source date. Matches update all columns by name; new keys insert all columns by name.
+`MERGE` statements update matching records and insert new ones. Race attributes include season, date, track, and field size; driver results include starting position, finishing position, laps completed, and finishing status.
 
-The event-list document is retained in Bronze but does not become a separate Silver table. The transformations neither deduplicate Bronze inputs nor delete Silver rows that disappear from the source. Their repeatability depends on unique, consistent source keys.
+### Gold — Driver-Season Performance
 
-### Gold: driver-season summary
+[`include/sql/build_gold.sql`](include/sql/build_gold.sql) rebuilds `GOLD.DRIVER_SEASON_SUMMARY` after quality checks pass.
 
-After the quality gate passes, [`include/sql/build_gold.sql`](include/sql/build_gold.sql) rebuilds `GOLD.DRIVER_SEASON_SUMMARY` with `CREATE OR REPLACE TABLE ... AS SELECT`.
+The summary groups results by season and driver to calculate:
 
-Rows are grouped by `race_season` and `driver_id`, using only results with `starting_position > 0`:
+- Starts
+- Wins
+- Top-five finishes
+- Average finishing position, rounded to two decimal places
 
-| Output | Calculation |
-| --- | --- |
-| `driver_name` | `MAX(driver_name)` within the group |
-| `starts` | Number of included result rows |
-| `wins` | Count of finishing positions equal to 1 |
-| `top_five_finishes` | Count of finishing positions from 1 through 5 |
-| `average_finish` | Mean of positive finishing positions, rounded to two decimals |
+Only results with a positive starting position contribute to the summary. Nonpositive finishing positions are excluded from average finish.
 
-This table supports season-level performance analysis. It does not calculate championship standings, playoff points, or official NASCAR points totals.
+This table supports performance analysis; it does not calculate championship points or standings.
 
-## Airflow orchestration
+## Airflow Orchestration
 
-The DAG in [`dags/nascar_race_elt.py`](dags/nascar_race_elt.py) is named `nascar_race_elt`:
+The [`nascar_race_elt`](dags/nascar_race_elt.py) DAG runs five sequential `BashOperator` tasks:
 
 ```text
 extract → load_bronze → build_silver → check_quality → build_gold
 ```
 
-| Setting | Value |
+| Setting | Configuration |
 | --- | --- |
-| Schedule | `@weekly` |
+| Schedule | Weekly |
 | Start date | January 1, 2025, UTC |
 | Catchup | Disabled |
-| Concurrent DAG runs | At most one |
-| Task retries | One retry after a two-minute delay |
-| Container script directory | `/usr/local/airflow/include` |
+| Maximum active runs | One |
+| Task retries | One retry after two minutes |
 
-Each task launches a Python script with `BashOperator`. `run_sql.py` executes SQL files statement by statement using `connection.execute_stream()`. With `--check`, it raises an exception if a statement returns any row, including the first failing row in the error message. Downstream tasks require upstream success, so a failed quality check prevents that run's Gold rebuild.
+Each task launches a Python script. [`include/run_sql.py`](include/run_sql.py) executes SQL files in Snowflake; its `--check` option raises an error when a validation query returns any row.
 
-The weekly schedule reruns the fixed 2025 dataset; it does not use Airflow's logical date to select new races. Tasks share local raw files, so extraction output must remain available to the loading task. No custom alerting or remote deployment configuration is included in the tracked project.
+The weekly schedule reruns the fixed 2025 dataset. It does not use Airflow’s execution date to select races. Extraction and loading also depend on access to the same local raw files.
 
-## Data-quality checks
+## Data Quality
 
-[`include/sql/check_quality.sql`](include/sql/check_quality.sql) contains five queries. Each must return **zero rows**:
+[`include/sql/check_quality.sql`](include/sql/check_quality.sql) contains five checks. Each query must return **zero rows** before Gold can be rebuilt.
 
 | Check | Failure condition |
 | --- | --- |
 | Referential integrity | A Silver driver result references a race missing from `SILVER.RACES` |
-| Finish-position bounds | Finish or field size is null, field size is nonpositive, finish is negative, or finish exceeds field size |
-| Bronze-to-Silver reconciliation | Per-race flattened Bronze result counts differ from Silver result counts |
-| Result uniqueness | More than one Silver row exists for the same `(race_id, driver_id)` |
-| Event-type validity | An event-list entry has a missing, nonnumeric, or unexpected race type outside `1` and `2` |
+| Finish-position bounds | A finish or field size is null, field size is nonpositive, or finish falls outside zero through field size |
+| Row-count reconciliation | Per-race result counts differ between Bronze and Silver |
+| Result uniqueness | Multiple Silver results exist for the same race and driver |
+| Event-type validity | An event-list race type is missing or outside the expected values `1` and `2` |
 
-A finishing position of zero is allowed by the quality query; Gold excludes it from the average. These checks do not assert a complete 36-race season, freshness, nonempty tables, all mandatory fields, or the correctness of Gold metrics. An entirely empty dataset can pass the SQL gate. Checks run after Silver writes and do not roll them back. Previously built Gold data can remain when a later run fails the gate.
+These checks run after Silver writes and do not roll them back. A failed check prevents that run’s Gold rebuild, but an existing Gold table remains available.
 
-## Repository structure
-
-The tracked project files are:
+## Repository Structure
 
 ```text
-.
-├── README.md
+├── dags/
+│   └── nascar_race_elt.py       # Airflow workflow
+├── include/
+│   ├── extract.py              # NASCAR API extraction
+│   ├── load_bronze.py          # Snowflake staging and loading
+│   ├── run_sql.py              # SQL execution and quality enforcement
+│   └── sql/
+│       ├── build_silver.sql
+│       ├── check_quality.sql
+│       └── build_gold.sql
+├── csvs/
+│   ├── extract_csv.py          # Optional CSV export
+│   └── validate_csvs.py        # Counts and duplicate reporting
+├── tests/
+│   └── dags/
+│       └── test_dag_example.py # Astronomer starter tests
 ├── Dockerfile
 ├── requirements.txt
 ├── packages.txt
-├── .dockerignore
-├── .gitignore
-├── dags/
-│   └── nascar_race_elt.py          # Five-task Airflow workflow
-├── include/
-│   ├── extract.py                # Fetch and preserve NASCAR JSON
-│   ├── load_bronze.py            # Upload and load original payloads
-│   ├── run_sql.py                # Execute SQL and enforce zero-row checks
-│   └── sql/
-│       ├── build_silver.sql       # Race and result MERGEs
-│       ├── check_quality.sql      # Five quality queries
-│       └── build_gold.sql         # Driver-season aggregate rebuild
-├── csvs/
-│   ├── extract_csv.py            # Optional CSV export
-│   └── validate_csvs.py          # Print CSV counts and duplicates
-└── tests/
-    └── dags/
-        └── test_dag_example.py   # Astronomer starter DAG tests
+└── README.md
 ```
 
-`include/data/raw/` is generated by extraction. Generated datasets, environment files, keys, and several local Astro configuration paths are ignored by Git. Local starter files and configuration may exist outside this tracked tree; they are not prerequisites supplied by a fresh clone.
+Generated datasets, environment files, and private-key files are excluded through Git ignore rules.
 
-## Local setup
+## Local Setup
 
-### 1. Prepare the runtime
+### 1. Prepare the Environment
 
-Install Docker with its engine running and the Astronomer Astro CLI. Obtain a local checkout of this repository and run the following commands from its root. The existing Dockerfile defines the runtime; there is no need to initialize another Astro project.
+You will need:
 
-### 2. Provision Snowflake prerequisites
+- Docker with its engine running.
+- Astronomer Astro CLI.
+- A Snowflake account and user configured for key-pair authentication.
+- A local checkout of this repository.
 
-The repository does **not** include bootstrap DDL, user provisioning, key registration, or grants. Before running the pipeline, arrange the following in Snowflake:
+The Dockerfile uses Astro Runtime `3.3-12`. `requirements.txt` declares `requests` and `snowflake-connector-python`; Airflow is supplied by the runtime image.
 
-- Database `NASCAR_RACE_ELT` and schemas `BRONZE`, `SILVER`, and `GOLD`.
-- Internal stage `BRONZE.RAW_JSON_STAGE`.
-- Table `BRONZE.RAW_NASCAR_JSON` with `RAW_DATA VARIANT`, `SOURCE_FILE VARCHAR`, and a timestamp-compatible `LOADED_AT` column.
-- Tables `SILVER.RACES` and `SILVER.RACE_RESULTS` with the exact column names listed above. Use numeric types for IDs, season, counts, and positions; `DATE` for `race_date`; and character types for names and status.
-- A Snowflake user configured for key-pair authentication and an effective default role with warehouse usage, database/schema access, stage read/write, Bronze select/insert, Silver select/insert/update, and permission to create or replace the Gold table.
-- Compute accessible to that user: **the Bronze loader hardcodes `SYSTEM$STREAMLIT_NOTEBOOK_WH`**, while the SQL runner uses `SNOWFLAKE_WAREHOUSE`. Setting the environment variable does not change the loader's warehouse. If the hardcoded warehouse is unavailable or unusable in your account, the loader cannot run as written.
+### 2. Provision Snowflake Objects
 
-No role is passed explicitly by either connection function. Gold is created by the transformation, but its database and schema must already exist.
+Bootstrap DDL and access grants are not included in the repository. Before running the pipeline, prepare:
 
-### 3. Supply authentication locally
+| Object | Required structure |
+| --- | --- |
+| Database | `NASCAR_RACE_ELT` |
+| Schemas | `BRONZE`, `SILVER`, `GOLD` |
+| Internal stage | `BRONZE.RAW_JSON_STAGE` |
+| Bronze table | `BRONZE.RAW_NASCAR_JSON`: `RAW_DATA VARIANT`, `SOURCE_FILE VARCHAR`, and timestamp-compatible `LOADED_AT` |
+| Silver race table | `SILVER.RACES`, matching the column names and types selected in `build_silver.sql` |
+| Silver results table | `SILVER.RACE_RESULTS`, matching the column names and types selected in `build_silver.sql` |
 
-Provide these environment variables to the Airflow task containers:
+The connection does not specify a role. The user’s effective default role needs warehouse usage, database/schema access, stage read/write access, Bronze select/insert permissions, Silver select/insert/update permissions, and permission to create or replace the Gold table.
+
+**Warehouse requirement:** The Bronze loader hardcodes `SYSTEM$STREAMLIT_NOTEBOOK_WH`. Transformations use `SNOWFLAKE_WAREHOUSE`. Setting that environment variable does not change the loader’s warehouse; the loader cannot run as written if its hardcoded warehouse is unavailable.
+
+### 3. Configure Authentication
+
+Provide these environment variables to the Airflow task containers using a private, Git-ignored root `.env` file:
 
 | Variable | Purpose |
 | --- | --- |
-| `SNOWFLAKE_ACCOUNT` | Your Snowflake account identifier |
-| `SNOWFLAKE_USER` | Your key-pair-enabled user |
-| `SNOWFLAKE_PRIVATE_KEY_FILE` | Absolute path to the private key **inside the container** |
-| `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE` | Passphrase for that key; required for unattended task execution |
-| `SNOWFLAKE_WAREHOUSE` | Warehouse used by `run_sql.py` |
+| `SNOWFLAKE_ACCOUNT` | Snowflake account identifier |
+| `SNOWFLAKE_USER` | User configured for key-pair authentication |
+| `SNOWFLAKE_PRIVATE_KEY_FILE` | Absolute private-key path inside the container |
+| `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE` | Key passphrase for unattended execution |
+| `SNOWFLAKE_WAREHOUSE` | Warehouse used by the SQL runner |
 
-Use a private, Git-ignored root `.env` file for local values. Mount the private key read-only into the containers that execute tasks and point `SNOWFLAKE_PRIVATE_KEY_FILE` at that mounted path. The tracked repository does not supply this mount configuration. Keep private keys outside the Docker build context and do not put credentials in the Dockerfile, SQL, or README. A host filesystem path alone does not make a key available inside Docker.
+Mount the private key read-only into the containers that execute tasks. The tracked repository does not include this mount configuration. A host path alone does not make the key accessible inside Docker.
 
-The scripts use environment variables directly, not Airflow Connections. `load_bronze.py` prompts interactively if the passphrase variable is missing, whereas `run_sql.py` requires it; provide it explicitly for Airflow.
+Keep private keys outside the Docker build context. Do not commit credentials or put them in the Dockerfile.
 
-See Astronomer's [local environment-variable guidance](https://www.astronomer.io/docs/astro/manage-connections-variables/) for configuration details. Restart the local runtime after changing environment values.
+The scripts read environment variables directly rather than using Airflow Connections. Supply the passphrase explicitly: the Bronze loader otherwise prompts interactively, while the SQL runner requires the variable.
 
-### 4. Start and trigger the pipeline
+### 4. Start Airflow
 
-After provisioning Snowflake and configuring container access to the key:
+With Docker running, execute from the repository root:
 
 ```bash
 astro dev start
 ```
 
-Open the local [Airflow UI](http://localhost:8080/), locate `nascar_race_elt`, enable it, and trigger a run. Inspect the five tasks and their logs in dependency order. Successful completion should populate Bronze and Silver and create the Gold summary; actual row counts depend on the API responses and existing warehouse state.
+Once startup completes, open [Airflow at localhost:8080](http://localhost:8080/), enable `nascar_race_elt`, and trigger a run. Inspect the task logs in execution order.
 
-To stop the local environment:
+**The local Airflow link works only while the environment is running on your computer.** GitHub hosts the repository, not the Airflow service.
+
+To stop the environment:
 
 ```bash
 astro dev stop
 ```
 
-For troubleshooting outside Airflow, the same scripts can be invoked from the repository root in a Python environment with `requirements.txt` installed and the required variables exported:
+### 5. Query the Results
 
-```bash
-python include/extract.py
-python include/load_bronze.py
-python include/run_sql.py build_silver.sql
-python include/run_sql.py check_quality.sql --check
-python include/run_sql.py build_gold.sql
-```
-
-Run these in order and stop on any failure. Standalone Python execution does not automatically read `.env`; export variables securely first and use a key path valid on the host. These commands perform real API requests and Snowflake writes.
-
-### 5. Inspect the analytical output
-
-After a successful run, an example read-only query is:
+After a successful pipeline run:
 
 ```sql
-SELECT race_season, driver_name, starts, wins,
-       top_five_finishes, average_finish
+SELECT
+    race_season,
+    driver_name,
+    starts,
+    wins,
+    top_five_finishes,
+    average_finish
 FROM NASCAR_RACE_ELT.GOLD.DRIVER_SEASON_SUMMARY
-ORDER BY wins DESC, top_five_finishes DESC, average_finish ASC;
+ORDER BY
+    wins DESC,
+    top_five_finishes DESC,
+    average_finish ASC;
 ```
 
-### Optional CSV exploration
+### Optional CSV Exploration
 
-With pandas available in your Python environment, run:
+The scripts under `csvs/` provide an independent path for exporting and inspecting the data:
 
 ```bash
 python csvs/extract_csv.py
 python csvs/validate_csvs.py
 ```
 
-These scripts create `csvs/race_events_2025.csv` and `csvs/weekend_results_2025.csv`, then print counts, duplicate counts, and sample rows. The validator does not raise errors on duplicates. This path is independent of the Airflow/Snowflake pipeline and requires pandas separately because the repository does not declare it.
+They generate event and driver-result CSV files, then print counts, duplicate counts, and sample rows. pandas must be available separately because it is not declared in `requirements.txt`. The validator reports duplicates without raising an error.
 
-## Engineering decisions and concepts
+## Engineering Decisions
 
-- **ELT with original payload retention:** Python handles transport and validation of requested race IDs, while Snowflake handles relational transformation. Keeping source JSON alongside filename and ingestion time helps trace warehouse records back to ingested files.
-- **Bronze/Silver/Gold separation:** Raw documents, typed entities, and analytical aggregates serve distinct purposes and make transformation responsibilities explicit.
-- **Semi-structured to relational modeling:** JSON path extraction, casts, and `LATERAL FLATTEN` turn nested race responses into race and driver-result grains.
-- **Key-based updates:** Silver `MERGE` statements allow matching records to be updated rather than blindly appended. Source uniqueness and stage-loading behavior still limit end-to-end repeatability.
-- **Quality as an orchestration dependency:** SQL queries describe invalid data, and the runner translates returned rows into a failing task before Gold is rebuilt.
-- **Simple batch orchestration:** Sequential tasks, a single active run, and one task retry keep the workflow easy to inspect. They do not provide distributed storage, transactional execution across the pipeline, or request-level recovery.
-- **Containerized development:** The versioned Astro Runtime image provides a consistent Airflow base, while credentials remain runtime inputs. Unpinned Python dependencies limit full build reproducibility.
+- **Preserve source data before transformation.** Original JSON and ingestion metadata support traceability and inspection of the source payloads.
+- **Separate storage and modeling responsibilities.** Bronze retains raw responses, Silver establishes relational grains, and Gold provides an analytical summary.
+- **Perform transformations in Snowflake.** JSON paths, casts, `LATERAL FLATTEN`, and SQL aggregation demonstrate warehouse-centered ELT.
+- **Use key-based merges for Silver.** Existing records can be updated without blindly appending every extraction. This still depends on unique source keys and correct loading behavior.
+- **Make validation an explicit dependency.** SQL checks become a required Airflow task before Gold is rebuilt.
+- **Keep orchestration straightforward.** Sequential tasks, one active run, and task retries provide a workflow that is easy to inspect and troubleshoot.
 
-## Validation status and limitations
+## Scope and Limitations
 
-The implementation includes runtime extraction checks and five warehouse quality checks. The committed test file is still the Astronomer starter suite: it expects DAG tags and at least two retries, while `nascar_race_elt` defines no tags and one retry. Those assertions conflict with the current DAG; the test suite should not be presented as passing or as end-to-end NASCAR validation.
+This project implements a fixed-season batch workflow. It does not include incremental watermarks, source-version deduplication, an explicit correction/reload strategy, or stale-file cleanup. Silver merges do not delete records removed upstream.
 
-Additional boundaries of the current implementation:
+Quality checks validate selected consistency rules, but do not guarantee nonempty data, freshness, a complete season, or correct Gold metrics. Execution is not transactional across the entire pipeline.
 
-- Season, series, database, schema/table names, and one warehouse are hardcoded; the project is not a configurable multi-season ingestion framework.
-- Extraction expects the desired race at `weekend_race[0]` and nonempty results for every selected race. It does not skip unfinished races or adapt to upstream schema changes.
-- There is no watermark, source-version deduplication, explicit correction/reload policy, or stale-file cleanup. Duplicate Bronze race payloads can affect merges and reconciliation.
-- Silver updates and checks are separate tasks; there is no transaction spanning the workflow or rollback after a failed gate. Gold is rebuilt rather than maintained incrementally.
-- Snowflake provisioning, container secret mounts, and account-specific access remain external setup requirements. Generated data is not bundled with a fresh clone.
-- No custom alerts, CI workflow, deployment automation, dashboard, or performance benchmark is implemented in the tracked repository.
+The committed Astronomer starter tests expect DAG tags and at least two retries; the current DAG has no tags and one retry. Those assertions conflict with the implementation and should not be treated as passing project validation.
 
-This documentation describes source-code behavior. It does not certify a successful live API extraction, container build, or Snowflake pipeline run in a new environment.
+Python dependencies are unpinned. Custom alerting, CI/CD, deployment automation, and dashboards are outside the implemented scope.
